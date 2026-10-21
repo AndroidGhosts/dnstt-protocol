@@ -1,60 +1,177 @@
-# DNSTT Protocol Prototype
+package main
 
-This repository contains a compact prototype of a DNSTT-inspired tunnel protocol built in Go.
+import (
+	"fmt"
+	"log"
+	"time"
+)
 
-It demonstrates the core mechanics of a DNS tunnel design:
+type TunnelServer struct {
+	transport   *UDPTransport
+	reassembler *Reassembler
+}
 
-- segmenting payloads
-- reassembly on the receiving side
-- stream ID tracking
-- frame checksums
-- UDP datagram transport
-- simple SYN/ACK/PING/PONG exchange
+func NewServer(listenAddr string) *TunnelServer {
+	tr, err := NewUDPTransport(listenAddr)
+	if err != nil {
+		log.Fatalf("server transport init failed: %v", err)
+	}
+	return &TunnelServer{
+		transport:   tr,
+		reassembler: NewReassembler(),
+	}
+}
 
-## Features
+func (s *TunnelServer) Run() {
+	for {
+		raw, remote, err := s.transport.ReadFrom()
+		if err != nil {
+			log.Printf("server read error: %v", err)
+			continue
+		}
+		if err := ValidateFrame(raw); err != nil {
+			log.Printf("server invalid frame from %s: %v", remote, err)
+			continue
+		}
 
-- custom binary frame format
-- checksum validation
-- fragmentation supported through sequence numbers
-- stream multiplexing friendly design
-- server/client demo over UDP
+		h, payload, err := ParseFrame(raw)
+		if err != nil {
+			log.Printf("server parse error: %v", err)
+			continue
+		}
 
-## Run
+		log.Printf("server recv type=%d stream=%d seq=%d frag=%d/%d len=%d from=%s", h.Type, h.StreamID, h.Seq, h.FragIndex, h.FragTotal, len(payload), remote)
 
-Start the server:
+		switch h.Type {
+		case FrameTypeSyn:
+			ack, _ := BuildFrame(FrameTypeAck, h.StreamID, h.Seq, 0, 1, []byte("syn-ack"), 0)
+			if err := s.transport.SendTo(remote, ack); err != nil {
+				log.Printf("server ack send failed: %v", err)
+			}
+		case FrameTypeData:
+			s.reassembler.Add(h, payload)
+			if assembled, ok := s.reassembler.Assemble(h.StreamID, h.Seq, h.FragTotal); ok {
+				fmt.Printf("server assembled payload: %s\n", string(assembled))
+				ack, _ := BuildFrame(FrameTypeAck, h.StreamID, h.Seq, 0, 1, []byte("ok"), 0)
+				if err := s.transport.SendTo(remote, ack); err != nil {
+					log.Printf("server ack send failed: %v", err)
+				}
+			}
+		case FrameTypePing:
+			reply, _ := BuildFrame(FrameTypePong, h.StreamID, h.Seq+1, 0, 1, []byte("pong"), 0)
+			if err := s.transport.SendTo(remote, reply); err != nil {
+				log.Printf("server pong failed: %v", err)
+			}
+		case FrameTypePong:
+			log.Printf("server got pong from %s", remote)
+		}
+	}
+}
 
-```bash
-go run . -role=server -listen=127.0.0.1:5300
-```
+func (s *TunnelServer) SendText(peer string, text string) error {
+	parts := SplitPayload([]byte(text), 128)
+	streamID := uint16(1)
+	seq := uint32(1)
+	for i, part := range parts {
+		flags := uint8(0)
+		if i == 0 {
+			flags |= FlagFirst
+		}
+		if i == len(parts)-1 {
+			flags |= FlagLast
+		}
+		frame, err := BuildFrame(FrameTypeData, streamID, seq, uint16(i), uint16(len(parts)), part, flags)
+		if err != nil {
+			return err
+		}
+		if err := s.transport.SendTo(peer, frame); err != nil {
+			return err
+		}
+		seq++
+		time.Sleep(15 * time.Millisecond)
+	}
+	return nil
+}
 
-Start the client:
+type TunnelClient struct {
+	transport   *UDPTransport
+	peer       string
+	reassembler *Reassembler
+}
 
-```bash
-go run . -role=client -listen=127.0.0.1:5301 -peer=127.0.0.1:5300
-```
+func NewClient(listenAddr, peer string) *TunnelClient {
+	tr, err := NewUDPTransport(listenAddr)
+	if err != nil {
+		log.Fatalf("client transport init failed: %v", err)
+	}
+	return &TunnelClient{
+		transport:   tr,
+		peer:       peer,
+		reassembler: NewReassembler(),
+	}
+}
 
-## Notes
+func (c *TunnelClient) Connect() error {
+	syn, err := BuildFrame(FrameTypeSyn, 1, 1, 0, 1, []byte("hello-server"), 0)
+	if err != nil {
+		return err
+	}
+	return c.transport.SendTo(c.peer, syn)
+}
 
-This is a protocol prototype, not a production-ready DNSTT implementation. It is intended as a foundation for:
+func (c *TunnelClient) SendText(text string) error {
+	parts := SplitPayload([]byte(text), 128)
+	streamID := uint16(1)
+	seq := uint32(2)
+	for i, part := range parts {
+		flags := uint8(0)
+		if i == 0 {
+			flags |= FlagFirst
+		}
+		if i == len(parts)-1 {
+			flags |= FlagLast
+		}
+		frame, err := BuildFrame(FrameTypeData, streamID, seq, uint16(i), uint16(len(parts)), part, flags)
+		if err != nil {
+			return err
+		}
+		if err := c.transport.SendTo(c.peer, frame); err != nil {
+			return err
+		}
+		seq++
+		time.Sleep(15 * time.Millisecond)
+	}
+	return nil
+}
 
-- adaptive MTU sizing
-- DNS TXT encoding
-- selective ACKs
-- retransmission logic
-- compression / encryption
-- real-world tunnel behavior
+func (c *TunnelClient) Run() {
+	for {
+		raw, remote, err := c.transport.ReadFrom()
+		if err != nil {
+			log.Printf("client read error: %v", err)
+			continue
+		}
+		if err := ValidateFrame(raw); err != nil {
+			log.Printf("client invalid frame from %s: %v", remote, err)
+			continue
+		}
+		h, payload, err := ParseFrame(raw)
+		if err != nil {
+			log.Printf("client parse error: %v", err)
+			continue
+		}
+		log.Printf("client recv type=%d stream=%d seq=%d frag=%d/%d len=%d from=%s", h.Type, h.StreamID, h.Seq, h.FragIndex, h.FragTotal, len(payload), remote)
 
-## Design Summary
-
-The protocol uses a simple frame with:
-
-- magic bytes (`DSNT`)
-- frame type
-- stream ID
-- sequence number
-- fragment index
-- total fragments
-- payload length
-- checksum
-
-This makes it possible to split large payloads into segments and reliably reassemble them on the other side.
+		switch h.Type {
+		case FrameTypeAck:
+			log.Printf("client acked: %s", string(payload))
+		case FrameTypeData:
+			c.reassembler.Add(h, payload)
+			if assembled, ok := c.reassembler.Assemble(h.StreamID, h.Seq, h.FragTotal); ok {
+				fmt.Printf("client assembled payload: %s\n", string(assembled))
+			}
+		case FrameTypePong:
+			fmt.Printf("client got pong: %s\n", string(payload))
+		}
+	}
+}
