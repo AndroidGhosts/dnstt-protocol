@@ -1,260 +1,89 @@
 package main
 
-// This file intentionally avoids a main() function so the project compiles as one package.
-// The actual logic lives in main.go, server.go, and dns_transport.go.
-
-// If you want to extend the project, add helpers here, not a second main entrypoint.
-
-var _ = 0
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+import (
+    "fmt"
+    "log"
+    "time"
+)
+
+type TunnelServer struct {
+    transport   *UDPTransport
+    reassembler *Reassembler
+}
+
+func NewServer(listenAddr string) *TunnelServer {
+    tr, err := NewUDPTransport(listenAddr)
+    if err != nil {
+        log.Fatalf("server transport init failed: %v", err)
+    }
+    return &TunnelServer{transport: tr, reassembler: NewReassembler()}
+}
+
+func (s *TunnelServer) Run() {
+    for {
+        raw, remote, err := s.transport.ReadFrom()
+        if err != nil {
+            log.Printf("server read error: %v", err)
+            continue
+        }
+        if err := ValidateFrame(raw); err != nil {
+            log.Printf("server invalid frame from %s: %v", remote, err)
+            continue
+        }
+
+        h, payload, err := ParseFrame(raw)
+        if err != nil {
+            log.Printf("server parse error: %v", err)
+            continue
+        }
+
+        log.Printf("server recv type=%d stream=%d seq=%d frag=%d/%d len=%d from=%s", h.Type, h.StreamID, h.Seq, h.FragIndex, h.FragTotal, len(payload), remote)
+
+        switch h.Type {
+        case FrameTypeSyn:
+            ack := BuildFrame(FrameTypeAck, h.StreamID, h.Seq, 0, 1, []byte("syn-ack"), 0)
+            if err := s.transport.SendTo(remote, ack); err != nil {
+                log.Printf("server ack send failed: %v", err)
+            }
+        case FrameTypeData:
+            s.reassembler.Add(h, payload)
+            if assembled, ok := s.reassembler.Assemble(h.StreamID, h.Seq, h.FragTotal); ok {
+                fmt.Printf("server assembled payload: %s\n", string(assembled))
+                ack := BuildFrame(FrameTypeAck, h.StreamID, h.Seq, 0, 1, []byte("ok"), 0)
+                if err := s.transport.SendTo(remote, ack); err != nil {
+                    log.Printf("server ack send failed: %v", err)
+                }
+            }
+        case FrameTypePing:
+            reply := BuildFrame(FrameTypePong, h.StreamID, h.Seq+1, 0, 1, []byte("pong"), 0)
+            if err := s.transport.SendTo(remote, reply); err != nil {
+                log.Printf("server pong failed: %v", err)
+            }
+        case FrameTypePong:
+            log.Printf("server got pong from %s", remote)
+        }
+    }
+}
+
+func (s *TunnelServer) SendText(peer, text string) error {
+    parts := SplitPayload([]byte(text), 128)
+    streamID := uint16(1)
+    seq := uint32(1)
+    for i, part := range parts {
+        flags := uint8(0)
+        if i == 0 {
+            flags |= FlagFirst
+        }
+        if i == len(parts)-1 {
+            flags |= FlagLast
+        }
+
+        frame := BuildFrame(FrameTypeData, streamID, seq, uint16(i), uint16(len(parts)), part, flags)
+        if err := s.transport.SendTo(peer, frame); err != nil {
+            return err
+        }
+        seq++
+        time.Sleep(15 * time.Millisecond)
+    }
+    return nil
+}

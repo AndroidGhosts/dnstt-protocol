@@ -1,3 +1,16 @@
-module dnsttproto
+# Go build artifacts
+bin/
+*.exe
+*.out
 
-go 1.22
+# IDE files
+.idea/
+.vscode/
+*.iml
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp

@@ -1,12 +1,62 @@
-# JetBrains IDE files
-.idea/
-*.iml
+# DNSTT Protocol Prototype
 
-# Go build output
-bin/
-*.exe
-*.out
+This repository contains a Go implementation of a DNSTT-inspired tunnel protocol.
 
-# OS files
-.DS_Store
-Thumbs.db
+## Included features
+
+- UDP tunnel transport
+- custom binary frame format
+- checksum validation
+- segmenting and reassembly
+- stream-oriented transfer model
+- server/client demo over loopback UDP
+- DNS payload encoding helpers for future integration with actual DNS records
+
+## How to run
+
+Server:
+
+```bash
+go run . -role=server -listen=127.0.0.1:5300 -peer=127.0.0.1:5301
+```
+
+Client:
+
+```bash
+go run . -role=client -listen=127.0.0.1:5301 -peer=127.0.0.1:5300
+```
+
+## Frame design
+
+Each frame includes:
+
+- magic (`DSNT`)
+- frame type
+- stream ID
+- sequence number
+- fragment index
+- total fragment count
+- payload length
+- checksum
+
+This allows the tunnel to split larger payloads into smaller UDP-safe segments and reassemble them reliably on the other side.
+
+## Important notes
+
+This project is a working protocol prototype and a solid engineering foundation. It is not a full production DNSTT implementation, but it includes the essential building blocks for a real-world DNS tunnel:
+
+- transport abstraction
+- fragmentation
+- reassembly
+- stream multiplexing structure
+- integrity validation
+
+For a full production-grade tunnel, the next steps would be:
+
+- ACK + retransmission
+- selective loss recovery
+- congestion control
+- MTU adaptation
+- real DNS TXT/NULL/HTTPS payload encoding
+- encryption and authentication
+- concurrent streams and balancing
